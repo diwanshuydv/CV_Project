@@ -1,0 +1,15 @@
+# Mirrors scripts/setup_env.sh. Install torch from the CUDA 12.8 index first:
+#   pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+#   SAM2_BUILD_CUDA=0 pip install --no-build-isolation -r requirements.txt
+torch==2.7.1
+torchvision==0.22.1
+scipy
+opencv-python-headless
+tifffile
+imagecodecs
+pillow
+tqdm
+pyyaml
+tensorboard
+pytest
+sam-2 @ git+https://github.com/facebookresearch/sam2.git

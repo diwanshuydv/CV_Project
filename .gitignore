@@ -1,0 +1,29 @@
+# Environment / tooling (rebuilt by scripts/setup_env.sh)
+.venv/
+.tools/
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Datasets (zips + extracted); keep the small, seeded split files
+data/*
+!data/splits/
+!data/splits/*.json
+
+# Model weights, training runs, SLURM logs
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+runs/
+logs/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
