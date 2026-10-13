@@ -34,9 +34,11 @@ always consistent with the mask the network actually sees.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -213,7 +215,7 @@ class DataConfig:
     max_nodata_frac: float = 0.25        # reject training crops with more no-data
     crop_retries: int = 10
     color_jitter: float = 0.2
-    cache_images: bool = True            # keep decoded images in RAM (per worker)
+    cache_images: bool = True            # keep decoded images in RAM (train: preloaded, shared by workers)
     seed: int = 0
     drive_fold: Optional[int] = None
 
@@ -238,18 +240,33 @@ class BinarySegDataset(Dataset):
             return self.cfg.samples_per_epoch
         return len(self.records)
 
-    def _load(self, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if idx in self._cache:
-            return self._cache[idx]
+    def _read(self, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         rec = self.records[idx]
         img = _read_image(rec.image)
         lbl = _read_binary(rec.label)
         fov = _read_binary(rec.fov) if rec.fov is not None else roads_fov(img)
         lbl = lbl * fov  # labels outside the FOV are meaningless
-        out = (img, lbl, fov)
+        return img, lbl, fov
+
+    def _load(self, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if idx in self._cache:
+            return self._cache[idx]
+        out = self._read(idx)
         if self.cfg.cache_images:
             self._cache[idx] = out
         return out
+
+    def preload(self, num_threads: int = 8) -> None:
+        """Decode every image into the cache up front.
+
+        Must run in the main process *before* the DataLoader workers fork: they then
+        share one copy-on-write copy of the arrays instead of each filling its own
+        cache (Roads: 1108 x ~11 MB per worker -> host OOM after a few epochs).
+        """
+        missing = [i for i in range(len(self.records)) if i not in self._cache]
+        with ThreadPoolExecutor(num_threads) as ex:
+            for i, out in zip(missing, ex.map(self._read, missing)):
+                self._cache[i] = out
 
     # -- training-time augmentation -------------------------------------------
     def _random_crop(self, img, lbl, fov):
@@ -352,6 +369,12 @@ def _worker_init(worker_id: int) -> None:
 def build_loader(ds: BinarySegDataset, batch_size: int, num_workers: int = 8,
                  shuffle: Optional[bool] = None) -> DataLoader:
     train = ds.mode == "train"
+    # Random crops make every train worker touch every image, so share one preloaded
+    # cache. gc.freeze() keeps the workers' GC from writing to (and thereby copying)
+    # the pages holding the cached objects.
+    if train and num_workers > 0 and ds.cfg.cache_images:
+        ds.preload(num_workers)
+        gc.freeze()
     return DataLoader(
         ds,
         batch_size=batch_size if train else 1,   # eval: full images of varying size
