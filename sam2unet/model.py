@@ -165,8 +165,12 @@ class UNetDecoder(nn.Module):
         if deep_supervision:
             self.aux_heads = nn.ModuleList(nn.Conv2d(c, 1, 1) for c in (d3, d2, d1))
 
-    def forward(self, image: torch.Tensor, feats: List[torch.Tensor]):
+    def forward(self, image: torch.Tensor, feats: List[torch.Tensor],
+                ctx16: Optional[torch.Tensor] = None):
+        """``ctx16``: optional extra stride-16 context (tile memory), added to the adapted f3."""
         a1, a2, a3, a4 = (ad(f) for ad, f in zip(self.adapters, feats))
+        if ctx16 is not None:
+            a3 = a3 + ctx16
         x1 = self.stem1(image)
         x2 = self.stem2(x1)
         u3 = self.up3(a4, a3)

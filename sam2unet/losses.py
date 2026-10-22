@@ -149,6 +149,55 @@ class BoundaryLoss(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+#                               Topology losses                               #
+# --------------------------------------------------------------------------- #
+def soft_skeleton(x: torch.Tensor, iters: int = 10) -> torch.Tensor:
+    """Differentiable morphological skeleton (Shit et al., CVPR 2021) of (B,1,H,W) in [0,1]."""
+    def erode(t):
+        return -torch.maximum(F.max_pool2d(-t, (3, 1), 1, (1, 0)), F.max_pool2d(-t, (1, 3), 1, (0, 1)))
+
+    def dilate(t):
+        return F.max_pool2d(t, 3, 1, 1)
+
+    skel = F.relu(x - dilate(erode(x)))
+    for _ in range(iters):
+        x = erode(x)
+        delta = F.relu(x - dilate(erode(x)))
+        skel = skel + F.relu(delta - skel * delta)
+    return skel
+
+
+class SkeletonRecallLoss(nn.Module):
+    """1 - recall of the (tubed) GT skeleton (Kirchhoff et al., ECCV 2024).
+
+    Every centreline pixel counts equally regardless of vessel/road width, so missing a
+    whole thin branch costs as much as missing a thick one -- the opposite of Dice.
+    """
+
+    def forward(self, prob, skel, fov):
+        s = skel * fov
+        num = (prob * s).flatten(1).sum(1)
+        den = s.flatten(1).sum(1)
+        has = (den > 0).float()
+        return ((1 - num / den.clamp_min(EPS)) * has).sum() / has.sum().clamp_min(1.0)
+
+
+class SoftClDiceLoss(nn.Module):
+    """1 - soft clDice; the GT skeleton is the precomputed (tubed) one from the dataloader."""
+
+    def __init__(self, iters: int = 10):
+        super().__init__()
+        self.iters = iters
+
+    def forward(self, prob, target, skel, fov):
+        sp = soft_skeleton(prob * fov, self.iters)
+        tprec = ((sp * target).flatten(1).sum(1) + 1) / (sp.flatten(1).sum(1) + 1)
+        sg = skel * fov
+        tsens = ((sg * prob).flatten(1).sum(1) + 1) / (sg.flatten(1).sum(1) + 1)
+        return (1 - 2 * tprec * tsens / (tprec + tsens)).mean()
+
+
+# --------------------------------------------------------------------------- #
 #                                Total loss                                   #
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -162,6 +211,8 @@ class LossConfig:
     alpha: float = 4.0
     tau: float = 0.1
     aux_weight: float = 0.4          # deep-supervision weight
+    w_skel: float = 0.0              # skeleton recall weight
+    w_cldice: float = 0.0            # soft clDice weight
 
 
 class BoundaryAwareLoss(nn.Module):
@@ -172,6 +223,8 @@ class BoundaryAwareLoss(nn.Module):
         self.cfg = cfg
         self.standard = BCEDiceLoss()
         self.boundary = BoundaryLoss(cfg.w_err, cfg.w_sdf, cfg.w_edge, cfg.alpha, cfg.tau)
+        self.skel_recall = SkeletonRecallLoss()
+        self.cldice = SoftClDiceLoss()
         self.lam = cfg.lambda_0 if cfg.lambda_max > 0 else 0.0
 
     def set_progress(self, progress: float) -> None:
@@ -183,26 +236,37 @@ class BoundaryAwareLoss(nn.Module):
         r = min(1.0, progress / max(c.ramp_fraction, EPS))
         self.lam = c.lambda_0 + r * (c.lambda_max - c.lambda_0)
 
-    def _single(self, logits, target, dist, fov):
+    def _single(self, logits, target, dist, fov, skel=None):
+        """``dist=None`` skips the boundary term (e.g. the downsampled global view)."""
         logits = logits.float()  # loss in fp32 under autocast
         std, logs = self.standard(logits, target, fov)
-        if self.lam > 0:
-            bnd, blogs = self.boundary(torch.sigmoid(logits), target, dist, fov)
+        prob = torch.sigmoid(logits)
+        if self.lam > 0 and dist is not None:
+            bnd, blogs = self.boundary(prob, target, dist, fov)
             logs.update(blogs)
         else:
             bnd = logits.new_zeros(())
         logs["boundary"] = bnd.detach()
-        return std + self.lam * bnd, logs
+        loss = std + self.lam * bnd
+        if skel is not None and self.cfg.w_skel > 0:
+            sr = self.skel_recall(prob, skel, fov)
+            loss = loss + self.cfg.w_skel * sr
+            logs["skel"] = sr.detach()
+        if skel is not None and self.cfg.w_cldice > 0:
+            cl = self.cldice(prob, target, skel, fov)
+            loss = loss + self.cfg.w_cldice * cl
+            logs["cldice"] = cl.detach()
+        return loss, logs
 
     def forward(self, outputs: Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]],
-                target, dist, fov):
+                target, dist, fov, skel=None):
         if isinstance(outputs, tuple):
             logits, aux = outputs
         else:
             logits, aux = outputs, []
-        loss, logs = self._single(logits, target, dist, fov)
+        loss, logs = self._single(logits, target, dist, fov, skel)
         for a in aux:  # deep supervision on intermediate decoder stages
-            loss = loss + self.cfg.aux_weight * self._single(a, target, dist, fov)[0] / max(len(aux), 1)
+            loss = loss + self.cfg.aux_weight * self._single(a, target, dist, fov, skel)[0] / max(len(aux), 1)
         logs["lambda"] = torch.tensor(self.lam)
         logs["total"] = loss.detach()
         return loss, logs

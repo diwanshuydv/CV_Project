@@ -22,7 +22,7 @@ from PIL import Image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from .metrics import aggregate, compute_metrics
+from .metrics import PixelStats, aggregate, compute_metrics
 from .utils import amp_dtype, to_device
 
 
@@ -50,10 +50,37 @@ def build_scheduler(optimizer, total_iters: int, warmup_iters: int, min_lr_ratio
 # --------------------------------------------------------------------------- #
 #                                  Training                                   #
 # --------------------------------------------------------------------------- #
+def _frame_targets(batch, box, window: int):
+    """Targets of one frame of a region: a crop for tiles, area-downsampled for the global view
+    (soft mask; skeleton max-pooled so thin centrelines survive; no distance map)."""
+    y, x, size = box
+    if size == window:
+        sl = (..., slice(y, y + size), slice(x, x + size))
+        return (batch["mask"][sl], batch["dist"][sl], batch["fov"][sl],
+                batch["skel"][sl] if "skel" in batch else None)
+    f = size // window
+    mask = F.avg_pool2d(batch["mask"], f)
+    fov = (F.avg_pool2d(batch["fov"], f) > 0.5).float()
+    skel = F.max_pool2d(batch["skel"], f) * fov if "skel" in batch else None
+    return mask, None, fov, skel
+
+
+def region_loss(res, batch, loss_fn, window: int, w_pass1: float = 0.5):
+    """Mean loss over the memory-conditioned tiles + ``w_pass1`` x mean over pass-1 frames."""
+    final = [loss_fn(out, *_frame_targets(batch, box, window)) for out, box in res["final"]]
+    first = [loss_fn(out, *_frame_targets(batch, box, window))[0] for out, box in res["frames"]]
+    loss = sum(l for l, _ in final) / len(final) + w_pass1 * sum(first) / len(first)
+    logs = {k: sum(lg[k] for _, lg in final) / len(final) for k in final[0][1]}
+    logs["pass1"] = (sum(first) / len(first)).detach()
+    logs["total"] = loss.detach()
+    return loss, logs
+
+
 def train_one_epoch(model, loader, loss_fn, optimizer, scheduler, scaler, device,
                     epoch: int, total_iters: int, logger=None, writer=None,
-                    grad_clip: float = 1.0, log_every: int = 20) -> Dict[str, float]:
+                    grad_clip: float = 1.0, log_every: int = 20, w_pass1: float = 0.5) -> Dict[str, float]:
     model.train()
+    region = getattr(model, "region_training", False)
     dtype = amp_dtype(device)
     iters_per_epoch = len(loader)
     sums: Dict[str, float] = {}
@@ -65,8 +92,11 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scheduler, scaler, device
         batch = to_device(batch, device)
 
         with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
-            out = model(batch["image"])
-        loss, logs = loss_fn(out, batch["mask"], batch["dist"], batch["fov"])
+            out = model.forward_region(batch["image"]) if region else model(batch["image"])
+        if region:
+            loss, logs = region_loss(out, batch, loss_fn, model.window, w_pass1)
+        else:
+            loss, logs = loss_fn(out, batch["mask"], batch["dist"], batch["fov"], batch.get("skel"))
 
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None and scaler.is_enabled():
@@ -97,6 +127,7 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scheduler, scaler, device
             logger.info(f"ep {epoch} it {it}/{iters_per_epoch} loss {float(loss):.4f} "
                         f"bce {float(logs['bce']):.4f} dice {float(logs['dice']):.4f} "
                         f"bnd {float(logs['boundary']):.4f} lam {float(logs['lambda']):.3f} "
+                        + "".join(f"{k} {float(logs[k]):.4f} " for k in ("skel", "cldice", "pass1") if k in logs) +
                         f"lr {optimizer.param_groups[0]['lr']:.2e} ({time.time() - t0:.0f}s)")
 
     return {k: v / max(iters_per_epoch, 1) for k, v in sums.items()}
@@ -154,18 +185,40 @@ def sliding_window_predict(model, image: torch.Tensor, window: int = 512, overla
     return (prob / norm.clamp_min(1e-6))[..., :H, :W]
 
 
+def predict_full(model, image: torch.Tensor, window: int = 512, overlap: float = 0.25,
+                 tta: bool = False) -> torch.Tensor:
+    """Full-image probabilities; models with their own whole-image inference (tile memory)
+    provide ``predict_full``, everything else uses the Gaussian-blended sliding window.
+    ``tta``: average over the identity and the horizontal / vertical / both flips."""
+    def run(x):
+        if hasattr(model, "predict_full"):
+            return model.predict_full(x, window, overlap)
+        return sliding_window_predict(model, x, window, overlap)
+
+    if not tta:
+        return run(image)
+    flips = [(), (-1,), (-2,), (-2, -1)]
+    return sum(torch.flip(run(torch.flip(image, f)), f) if f else run(image) for f in flips) / len(flips)
+
+
 @torch.no_grad()
 def evaluate(model, loader, device, window: int = 512, overlap: float = 0.25,
              threshold: float = 0.5, save_dir: Optional[Path] = None,
-             max_images: Optional[int] = None, test_scale: float = 1.0) -> Dict[str, object]:
-    """Per-image metrics inside the FOV + dataset aggregate.
+             max_images: Optional[int] = None, test_scale: float = 1.0,
+             topology: bool = True, tta: bool = False) -> Dict[str, object]:
+    """Per-image metrics inside the FOV + dataset aggregate + pixel-pooled metrics.
 
+    ``threshold`` binarises the probabilities for the per-image metrics and the pooled
+    Se/Sp/Acc/F1; the pooled summary also reports AUC, ODS/OIS and the F1-optimal
+    threshold (``ods_thr``, used to pick the test threshold on the validation set).
+    ``topology=False`` skips clDice / Betti / relaxed metrics (fast validation).
     ``test_scale`` != 1 resamples the input before inference (and the prediction
     back to the original size) -- handy for cross-domain tests where structure
     widths differ (e.g. 1-8 px vessels vs 10-20 px roads).
     """
     model.eval()
     rows = []
+    stats = PixelStats()
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
     for n, batch in enumerate(loader):
@@ -176,19 +229,22 @@ def evaluate(model, loader, device, window: int = 512, overlap: float = 0.25,
         if test_scale != 1.0:
             H, W = img.shape[-2:]
             img_s = F.interpolate(img, scale_factor=test_scale, mode="bilinear", align_corners=False)
-            prob = F.interpolate(sliding_window_predict(model, img_s, window, overlap),
+            prob = F.interpolate(predict_full(model, img_s, window, overlap, tta),
                                  size=(H, W), mode="bilinear", align_corners=False)
         else:
-            prob = sliding_window_predict(model, img, window, overlap)
-        pred = (prob[0, 0] > threshold).cpu().numpy()
+            prob = predict_full(model, img, window, overlap, tta)
+        prob = prob[0, 0].float().cpu().numpy()
+        pred = prob > threshold
         gt = batch["mask"][0, 0].cpu().numpy() > 0.5
         fov = batch["fov"][0, 0].cpu().numpy() > 0.5
-        m = compute_metrics(pred, gt, fov)
+        stats.update(prob, gt, fov)
+        m = compute_metrics(pred, gt, fov, topology=topology)
         m["name"] = batch["name"][0]
         rows.append(m)
         if save_dir is not None:
             Image.fromarray((pred & fov).astype(np.uint8) * 255).save(save_dir / f"{m['name']}_pred.png")
-            Image.fromarray((prob[0, 0].cpu().numpy() * 255).astype(np.uint8)).save(
-                save_dir / f"{m['name']}_prob.png")
+            Image.fromarray((prob * 255).astype(np.uint8)).save(save_dir / f"{m['name']}_prob.png")
     summary = aggregate({k: v for k, v in r.items() if k != "name"} for r in rows)
+    summary.update(stats.summary(threshold))
+    summary["threshold"] = threshold
     return {"summary": summary, "per_image": rows}

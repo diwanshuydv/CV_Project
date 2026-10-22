@@ -1,21 +1,27 @@
 """
 Step 1 -- Datasets & dataloaders for thin-structure binary segmentation.
 
-Supported datasets
+Supported datasets (``build_dataset`` names; provenance in data/raw/SOURCES.md)
 ------------------
-* DRIVE (retinal vessels, Kaggle mirror layout)
-      DRIVE/training/images/21_training.tif
-      DRIVE/training/1st_manual/21_manual1.gif      <- vessel ground truth
-      DRIVE/training/mask/21_training_mask.gif      <- field-of-view (FOV) mask
-  The public test split ships *without* vessel labels, so the 20 labelled
-  training images are split deterministically into train/val/test
-  (default 14/2/4, or k-fold cross-validation via ``fold``).
+Retinal vessels
+* ``drive``      official 20 train / 20 test (test labels in DRIVE/test/1st_manual)
+* ``drive_dev``  the 20 labelled training images split 14/2/4 (or k-fold via ``fold``);
+                 used by the first experiments, kept for reproducibility
+* ``chase``      CHASE_DB1, 20 train (subjects 01-10) / 8 test (11-14), 1st observer
+* ``stare``      STARE, 10 train / 10 test, Hoover labels
+* ``hrf``        HRF, images 01-05 of each category train (15) / 06-15 test (30)
+Roads
+* ``roads``      Massachusetts Roads, official train/val/test (1500x1500 tiles; white
+                 "no-data" regions are treated as outside the FOV)
+* ``deepglobe``  DeepGlobe Roads, 4696 train / 1530 test split of Batra et al. 2019
+Cracks
+* ``crack500``   CRACK500 crops, official train/val/test lists
+* ``deepcrack``  DeepCrack, 300 train / 237 test
+* ``cracktree200``, ``cfd``, ``gaps384``   test-only (FPHBN cross-dataset protocol)
 
-* Massachusetts Roads (Kaggle mirror layout)
-      roads/tiff/{train,val,test}/<id>.tiff
-      roads/tiff/{train,val,test}_labels/<id>.tif
-  Images are 1500x1500 aerial tiles; some training tiles contain large white
-  "no-data" regions which are treated as outside the FOV.
+Validation: datasets without an official validation split hold out a few training
+images (``n_val``).  ``DataConfig.trainval`` merges them back into the training
+set for final runs (model selection is then the last epoch).
 
 Every sample is returned as a dict::
 
@@ -127,6 +133,18 @@ def signed_distance_map(mask: np.ndarray, max_dist: float = 20.0) -> np.ndarray:
     return np.clip(phi, -max_dist, max_dist) / max_dist
 
 
+def tubed_skeleton(mask: np.ndarray) -> np.ndarray:
+    """1-px skeleton of the mask dilated by one pixel (3x3), as in Skeleton Recall (ECCV 2024):
+    the tube makes the target robust to the exact centreline position."""
+    from scipy.ndimage import binary_dilation
+    from skimage.morphology import skeletonize
+
+    if not mask.any():
+        return np.zeros(mask.shape, np.uint8)
+    skel = skeletonize(np.ascontiguousarray(mask, dtype=bool))
+    return (binary_dilation(skel, structure=np.ones((3, 3), bool)) & mask.astype(bool)).astype(np.uint8)
+
+
 # --------------------------------------------------------------------------- #
 #                         Dataset "sources" (file lists)                      #
 # --------------------------------------------------------------------------- #
@@ -135,7 +153,8 @@ class SampleRecord:
     name: str
     image: Path
     label: Path
-    fov: Optional[Path] = None   # None -> computed from the image (roads)
+    fov: Optional[Path] = None   # None -> computed from the image with ``fov_mode``
+    fov_mode: str = "roads"      # 'roads' (non-white), 'fundus' (non-black disc), 'all'
 
 
 class DriveSource:
@@ -197,9 +216,175 @@ class RoadsSource:
         ]
 
 
+def _hold_out(records: List[SampleRecord], n_val: int, seed: int) -> Tuple[list, list]:
+    """Deterministically move ``n_val`` records of a training list into a validation list."""
+    order = list(range(len(records)))
+    random.Random(seed).shuffle(order)
+    val = set(order[:n_val])
+    return ([r for i, r in enumerate(records) if i not in val],
+            [r for i, r in enumerate(records) if i in val])
+
+
+class OfficialDriveSource:
+    """DRIVE with the official protocol: 20 training images, 20 labelled test images."""
+
+    def __init__(self, root: str, split: str, n_val: int = 2, seed: int = 0):
+        base = Path(root) / "DRIVE"
+        train = [SampleRecord(f"drive_{i}", base / "training" / "images" / f"{i}_training.tif",
+                              base / "training" / "1st_manual" / f"{i}_manual1.gif",
+                              base / "training" / "mask" / f"{i}_training_mask.gif")
+                 for i in range(21, 41)]
+        test = [SampleRecord(f"drive_{i:02d}", base / "test" / "images" / f"{i:02d}_test.tif",
+                             base / "test" / "1st_manual" / f"{i:02d}_manual1.png",
+                             base / "test" / "mask" / f"{i:02d}_test_mask.gif")
+                for i in range(1, 21)]
+        tr, va = _hold_out(train, n_val, seed)
+        self.splits = {"train": tr, "val": va, "trainval": train, "test": test}
+
+
+class ChaseSource:
+    """CHASE_DB1: subjects 01-10 train (20 images), 11-14 test (8); both eyes stay together."""
+
+    def __init__(self, root: str, split: str, n_val: int = 2, seed: int = 0):
+        base = Path(root) / "raw" / "chase"
+        recs = sorted(
+            (SampleRecord(f"chase_{p.stem}", p, p.parent.parent / "label" / f"{p.stem}_1stHO.png",
+                          fov_mode="fundus")
+             for p in base.glob("*/input/Image_*.png")), key=lambda r: r.name)
+        if len(recs) != 28:
+            raise FileNotFoundError(f"Expected 28 CHASE_DB1 images under {base}, found {len(recs)}")
+        subj = lambda r: int(r.name.split("_")[2][:2])
+        train = [r for r in recs if subj(r) <= 10]
+        # validation = one whole subject (both eyes), never split across sets
+        va = [r for r in train if subj(r) == 10] if n_val else []
+        tr = [r for r in train if r not in va]
+        self.splits = {"train": tr, "val": va, "trainval": train,
+                       "test": [r for r in recs if subj(r) > 10]}
+
+
+class StareSource:
+    """STARE: the 10/10 split used by the HF mirror (im0001-im0082 train, im0139-im0324 test)."""
+
+    def __init__(self, root: str, split: str, n_val: int = 1, seed: int = 0):
+        base = Path(root) / "raw" / "stare"
+
+        def recs(d):
+            return [SampleRecord(f"stare_{p.stem}", p, base / d / "label" / f"{p.stem}.ah.ppm",
+                                 fov_mode="fundus")
+                    for p in sorted((base / d / "input").glob("*.ppm"))]
+
+        train = recs("train")
+        tr, va = _hold_out(train, n_val, seed)
+        self.splits = {"train": tr, "val": va, "trainval": train, "test": recs("val")}
+
+
+class HrfSource:
+    """HRF (3504x2336): images 01-05 of each category (dr/g/h) train, 06-15 test."""
+
+    def __init__(self, root: str, split: str, n_val: int = 3, seed: int = 0):
+        base = Path(root) / "raw" / "hrf"
+        recs = [SampleRecord(f"hrf_{p.stem}", p, base / "manual1" / f"{p.stem}.tif",
+                             base / "mask" / f"{p.stem}_mask.tif")
+                for p in sorted((base / "images").iterdir())]
+        num = lambda r: int(r.name.split("_")[1])
+        train = [r for r in recs if num(r) <= 5]
+        va = [r for r in train if num(r) == 5] if n_val else []   # one image per category
+        self.splits = {"train": [r for r in train if r not in va], "val": va, "trainval": train,
+                       "test": [r for r in recs if num(r) > 5]}
+
+
+class DeepGlobeSource:
+    """DeepGlobe Roads with the 4696/1530 split of Batra et al. (CVPR 2019)."""
+
+    def __init__(self, root: str, split: str, n_val: int = 100, seed: int = 0):
+        base = Path(root) / "raw" / "deepglobe"
+        by_id = {p.name.split("_")[0]: p for p in base.glob("*/images/*_sat.jpg")}
+
+        def recs(lst):
+            ids = [l.strip() for l in (base / "batra_split" / lst).read_text().split() if l.strip()]
+            return [SampleRecord(f"deepglobe_{i}", by_id[i],
+                                 by_id[i].parent.parent / "masks" / f"{i}_mask.png", fov_mode="all")
+                    for i in ids]
+
+        train = recs("train.txt")
+        tr, va = _hold_out(train, n_val, seed)
+        self.splits = {"train": tr, "val": va, "trainval": train, "test": recs("val.txt")}
+
+
+class CrackListSource:
+    """Crack datasets of the FPHBN bundle, defined by '<image> <label>' list files."""
+
+    LISTS = {  # name -> (folder, {split: list file}, label dir, label suffix)
+        "crack500": ("CRACK500", {"train": "train.txt", "val": "val.txt", "test": "test.txt"}, None, ".png"),
+        "cracktree200": ("cracktree200", {"test": "test.txt"}, "cracktree200_gt", ".png"),
+        "cfd": ("CFD", {"test": "test.txt"}, "seg_gt", ".png"),
+        "gaps384": ("GAPS384", {"test": "test.txt"}, "croppedgt", ".png"),
+    }
+
+    def __init__(self, root: str, name: str, split: str):
+        folder, lists, lbl_dir, suffix = self.LISTS[name]
+        base = Path(root) / "raw" / "pavement" / folder
+        self.splits = {}
+        for s, lst in lists.items():
+            recs = []
+            for line in (base / lst).read_text().splitlines():
+                if not line.strip():
+                    continue
+                img = base / line.split()[0]
+                lbl = (img.parent if lbl_dir is None else base / lbl_dir) / f"{img.stem}{suffix}"
+                if lbl.exists():   # CFD's list contains a few images without a label
+                    recs.append(SampleRecord(f"{name}_{img.stem}", img, lbl, fov_mode="all"))
+            self.splits[s] = recs
+        if "train" in self.splits:
+            self.splits["trainval"] = self.splits["train"] + self.splits["val"]
+
+
+class DeepCrackSource:
+    """DeepCrack (Liu et al. 2019): 300 train / 237 test."""
+
+    def __init__(self, root: str, split: str, n_val: int = 20, seed: int = 0):
+        base = Path(root) / "raw" / "deepcrack"
+
+        def recs(s):
+            return [SampleRecord(f"deepcrack_{p.stem}", p, base / f"{s}_lab" / f"{p.stem}.png",
+                                 fov_mode="all")
+                    for p in sorted((base / f"{s}_img").glob("*.jpg"))]
+
+        train = recs("train")
+        tr, va = _hold_out(train, n_val, seed)
+        self.splits = {"train": tr, "val": va, "trainval": train, "test": recs("test")}
+
+
 def roads_fov(image: np.ndarray) -> np.ndarray:
     """Valid-pixel mask for aerial tiles: pure-white pixels are 'no data'."""
     return (~np.all(image >= 250, axis=-1)).astype(np.uint8)
+
+
+def fundus_fov(image: np.ndarray, erode: int = 3) -> np.ndarray:
+    """Circular field of view of a fundus photograph without an official mask (CHASE, STARE).
+
+    The retina is strongly red while the background is dark but noisy (STARE's reaches
+    ~45 grey levels, so a fixed threshold leaks into it): threshold the smoothed red
+    channel at half its Otsu level, keep the largest component, fill holes and erode a
+    few pixels off the rim.
+    """
+    from scipy.ndimage import binary_erosion as erosion, binary_fill_holes, gaussian_filter
+    from scipy.ndimage import label as cc_label
+    from skimage.filters import threshold_otsu
+
+    red = gaussian_filter(image[..., 0].astype(np.float32), 3)
+    m = red > 0.5 * threshold_otsu(red)
+    lab, n = cc_label(m)
+    if n > 1:
+        m = lab == (np.bincount(lab.ravel())[1:].argmax() + 1)
+    m = binary_fill_holes(m)
+    if erode:
+        m = erosion(m, iterations=erode)
+    return m.astype(np.uint8)
+
+
+FOV_FUNCS = {"roads": roads_fov, "fundus": fundus_fov,
+             "all": lambda img: np.ones(img.shape[:2], np.uint8)}
 
 
 # --------------------------------------------------------------------------- #
@@ -218,6 +403,9 @@ class DataConfig:
     cache_images: bool = True            # keep decoded images in RAM (train: preloaded, shared by workers)
     seed: int = 0
     drive_fold: Optional[int] = None
+    trainval: bool = False               # train on train+val (final runs; select last epoch)
+    scale: float = 1.0                   # resize *training* images (e.g. 2 for small fundus images);
+                                         # evaluation runs at the same scale via evaluate(test_scale=)
 
 
 class BinarySegDataset(Dataset):
@@ -244,8 +432,10 @@ class BinarySegDataset(Dataset):
         rec = self.records[idx]
         img = _read_image(rec.image)
         lbl = _read_binary(rec.label)
-        fov = _read_binary(rec.fov) if rec.fov is not None else roads_fov(img)
+        fov = _read_binary(rec.fov) if rec.fov is not None else FOV_FUNCS[rec.fov_mode](img)
         lbl = lbl * fov  # labels outside the FOV are meaningless
+        if self.mode == "train" and self.cfg.scale != 1.0:
+            img, lbl, fov = _rescale(img, lbl, fov, self.cfg.scale)
         return img, lbl, fov
 
     def _load(self, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -322,13 +512,27 @@ class BinarySegDataset(Dataset):
         dist = signed_distance_map(lbl, self.cfg.max_dist)
 
         img = (img - IMAGENET_MEAN) / IMAGENET_STD
-        return {
+        out = {
             "image": torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))).float(),
             "mask": torch.from_numpy(np.ascontiguousarray(lbl))[None].float(),
             "dist": torch.from_numpy(np.ascontiguousarray(dist))[None].float(),
             "fov": torch.from_numpy(np.ascontiguousarray(fov))[None].float(),
             "name": name,
         }
+        if self.mode == "train":  # centreline target for the topology losses
+            out["skel"] = torch.from_numpy(tubed_skeleton(lbl))[None].float()
+        return out
+
+
+def _rescale(img, lbl, fov, scale: float):
+    """Bilinear image; label resampled bilinearly and re-thresholded at 0.5 (keeps 1-px vessels
+    connected when upsampling); FOV nearest."""
+    H, W = lbl.shape
+    size = (round(W * scale), round(H * scale))
+    img = np.array(Image.fromarray(img).resize(size, Image.BILINEAR))
+    lbl = (np.array(Image.fromarray(lbl.astype(np.float32)).resize(size, Image.BILINEAR)) >= 0.5)
+    fov = np.array(Image.fromarray(fov).resize(size, Image.NEAREST))
+    return img, (lbl & (fov > 0)).astype(np.uint8), fov
 
 
 def _pad_to_min(img, lbl, fov, size):
@@ -344,20 +548,38 @@ def _pad_to_min(img, lbl, fov, size):
 # --------------------------------------------------------------------------- #
 #                                  Factories                                  #
 # --------------------------------------------------------------------------- #
-DATASETS = ("drive", "roads")
+DATASETS = ("drive", "drive_dev", "chase", "stare", "hrf", "roads", "deepglobe",
+            "crack500", "deepcrack", "cracktree200", "cfd", "gaps384")
+DEFAULT_SAMPLES_PER_EPOCH = {"drive": 500, "drive_dev": 500, "chase": 500, "stare": 500, "hrf": 500,
+                             "roads": 2000, "deepglobe": 2000, "crack500": 2000, "deepcrack": 1000}
+
+
+def build_records(name: str, split: str, cfg: DataConfig) -> List[SampleRecord]:
+    """File list of one split; ``split`` in {'train', 'val', 'test'}."""
+    name = name.lower()
+    if name == "drive_dev":
+        return DriveSource(cfg.data_root, split, seed=cfg.seed, fold=cfg.drive_fold).records
+    if name == "roads":
+        return RoadsSource(cfg.data_root, split).records
+    sources = {"drive": OfficialDriveSource, "chase": ChaseSource, "stare": StareSource,
+               "hrf": HrfSource, "deepglobe": DeepGlobeSource, "deepcrack": DeepCrackSource}
+    if name in sources:
+        splits = sources[name](cfg.data_root, split, seed=cfg.seed).splits
+    elif name in CrackListSource.LISTS:
+        splits = CrackListSource(cfg.data_root, name, split).splits
+    else:
+        raise ValueError(f"Unknown dataset '{name}'. Choose from {DATASETS}.")
+    if split == "train" and cfg.trainval:
+        split = "trainval"
+    if split not in splits:
+        raise ValueError(f"Dataset '{name}' has no '{split}' split (test-only: {list(splits)})")
+    return splits[split]
 
 
 def build_dataset(name: str, split: str, cfg: DataConfig) -> BinarySegDataset:
-    """``name`` in {'drive', 'roads'}; ``split`` in {'train', 'val', 'test'}."""
-    name = name.lower()
-    if name == "drive":
-        src = DriveSource(cfg.data_root, split, seed=cfg.seed, fold=cfg.drive_fold)
-    elif name == "roads":
-        src = RoadsSource(cfg.data_root, split)
-    else:
-        raise ValueError(f"Unknown dataset '{name}'. Choose from {DATASETS}.")
+    """``name`` in DATASETS; ``split`` in {'train', 'val', 'test'}."""
     mode = "train" if split == "train" else "eval"
-    return BinarySegDataset(src.records, mode, cfg)
+    return BinarySegDataset(build_records(name, split, cfg), mode, cfg)
 
 
 def _worker_init(worker_id: int) -> None:
