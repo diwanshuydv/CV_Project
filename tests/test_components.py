@@ -313,3 +313,31 @@ def test_topology_losses():
     assert SoftClDiceLoss()(g, g, sk, fov) < 0.1 < SoftClDiceLoss()(half, g, sk, fov)
     s = soft_skeleton(g)
     assert s.sum() > 0 and s.max() <= 1 + 1e-6
+
+
+# --------------------------- High-frequency prior -------------------------- #
+def test_high_frequency_prior():
+    from sam2unet.model import HighFrequencyPrior
+    hf = HighFrequencyPrior()
+    flat = torch.zeros(1, 3, 37, 50)                        # constant image -> no detail
+    h1, h2, h4 = hf(flat)
+    assert h1.shape == (1, 4, 37, 50) and h2.shape == (1, 3, 19, 25) and h4.shape == (1, 3, 10, 13)
+    assert all(float(h.abs().max()) < 1e-3 for h in (h1, h2, h4))
+    img = torch.zeros(1, 3, 32, 32); img[..., :, 16] = 3.0  # a thin bright vertical line
+    h1, h2, _ = hf(img)
+    assert h1[0, 3, 10, 15] > h1[0, 3, 10, 5] and h2[0, 1].max() > h2[0, 0].max()  # HL band sees it
+
+
+def test_model_with_hf_prior():
+    pytest.importorskip("sam2")
+    from sam2unet.model import SAM2UNet
+    model = SAM2UNet(trunk=tiny_hiera(), lora_r=2, hf_prior=True)
+    model.train()
+    logits, aux = model(torch.randn(2, 3, 96, 128))
+    assert logits.shape == (2, 1, 96, 128)
+    logits.mean().backward()
+    assert model.decoder.upf.block.body[0].weight.grad is not None
+    assert not any("hf." in k for k in model.trainable_state_dict())   # fixed filters are not saved
+    model.eval()
+    p = sliding_window_predict(model, torch.randn(1, 3, 150, 170), window=128)
+    assert p.shape == (1, 1, 150, 170)

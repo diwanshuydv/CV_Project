@@ -131,13 +131,13 @@ class SAM2MemUNet(SAM2UNet):
                  grad_checkpointing: bool = False, deep_supervision: bool = True,
                  window: int = 512, region: int = 1024, use_global: bool = True,
                  use_tiles: bool = True, mem_lora_r: int = 8, sam: Optional[nn.Module] = None,
-                 trunk: Optional[nn.Module] = None):
+                 trunk: Optional[nn.Module] = None, hf_prior: bool = False):
         if sam is None and trunk is None:
             from sam2.build_sam import build_sam2
             sam = build_sam2(SAM2_VARIANTS[variant][0], checkpoint_path, device="cpu", mode="eval")
         super().__init__(variant, checkpoint_path, lora_r, lora_alpha, lora_dropout,
                          grad_checkpointing, deep_supervision,
-                         trunk=sam.image_encoder.trunk if sam is not None else trunk)
+                         trunk=sam.image_encoder.trunk if sam is not None else trunk, hf_prior=hf_prior)
         assert region % window == 0 and window % 32 == 0
         self.window, self.region = window, region
         self.use_global, self.use_tiles = use_global, use_tiles

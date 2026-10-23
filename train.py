@@ -57,6 +57,8 @@ def parse_args(argv=None):
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--grad_ckpt", action="store_true", help="activation checkpointing in Hiera")
     p.add_argument("--no_deep_supervision", action="store_true")
+    p.add_argument("--hf_prior", action="store_true",
+                   help="concatenate fixed Sobel / Haar-DWT high-frequency maps into the stride-4/2/1 skips")
     p.add_argument("--model", choices=["sam2unet", "tsm"], default="sam2unet",
                    help="tsm = SAM2-UNet + tile-sequence memory (trains on regions of --region px)")
     p.add_argument("--memory", choices=["both", "global", "tiles"], default="both",

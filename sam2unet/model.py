@@ -143,11 +143,74 @@ class UpBlock(nn.Module):
         return self.block(torch.cat([x, skip], dim=1))
 
 
+class HighFrequencyPrior(nn.Module):
+    """Fixed (non-learned) high-frequency maps of the raw image for the decoder skips.
+
+    The Hiera encoder's finest features are at stride 4, so 1-2 px structures are smoothed
+    away before the decoder sees them.  This module hands the decoder deterministic detail
+    at the resolution of each high-resolution stage:
+
+      stride 1 : Sobel gradient magnitude of R, G, B and luminance          (4 ch)
+      stride 2 : Haar DWT level-1 detail bands LH, HL, HH of the luminance  (3 ch)
+      stride 4 : Haar DWT level-2 detail bands of the level-1 approximation (3 ch)
+
+    Every map is |response| divided by its per-image mean (+eps) and passed through log1p,
+    so contrast differences between datasets (fundus / aerial / pavement) are factored out.
+    No parameters; Canny is deliberately not used -- its hard, image-dependent thresholds
+    discard exactly the faint low-contrast structures that are missed.
+    """
+
+    CHANNELS = (4, 3, 3)   # stride 1, 2, 4
+
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]) / 8.0
+        self.register_buffer("sobel", torch.stack([kx, kx.t()])[:, None], persistent=False)   # (2,1,3,3)
+        h = torch.tensor([[1., 1.], [1., 1.]]) / 2.0                 # orthonormal 2-D Haar
+        lh = torch.tensor([[1., 1.], [-1., -1.]]) / 2.0
+        hl = torch.tensor([[1., -1.], [1., -1.]]) / 2.0
+        hh = torch.tensor([[1., -1.], [-1., 1.]]) / 2.0
+        self.register_buffer("haar", torch.stack([h, lh, hl, hh])[:, None], persistent=False)  # (4,1,2,2)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
+
+    @staticmethod
+    def _norm(x: torch.Tensor) -> torch.Tensor:
+        x = x.abs()
+        return torch.log1p(x / (x.mean(dim=(-2, -1), keepdim=True) + 1e-3))   # floor: flat image -> ~0
+
+    def _dwt(self, x: torch.Tensor):
+        """One Haar level of (B,1,H,W) -> approximation (B,1,H/2,W/2), details (B,3,H/2,W/2)."""
+        H, W = x.shape[-2:]
+        x = F.pad(x, (0, W % 2, 0, H % 2), mode="replicate")
+        y = F.conv2d(x, self.haar.to(x.dtype), stride=2)
+        return y[:, :1], y[:, 1:]
+
+    @torch.no_grad()
+    def forward(self, image: torch.Tensor) -> List[torch.Tensor]:
+        """image: ImageNet-normalised (B,3,H,W) -> [stride-1, stride-2, stride-4] maps."""
+        x = (image.float() * self.std + self.mean).clamp(0, 1)
+        lum = (0.299 * x[:, :1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3])
+        chans = torch.cat([x, lum], 1)                                         # (B,4,H,W)
+        B, C, H, W = chans.shape
+        g = F.conv2d(F.pad(chans.reshape(B * C, 1, H, W), (1, 1, 1, 1), mode="replicate"),
+                     self.sobel)
+        s1 = torch.sqrt(g.pow(2).sum(1, keepdim=True) + 1e-12).reshape(B, C, H, W)
+        a1, d1 = self._dwt(lum)
+        _, d2 = self._dwt(a1)
+        out = [self._norm(s1), self._norm(d1), self._norm(d2)]
+        return [o.to(image.dtype) for o in out]
+
+
 class UNetDecoder(nn.Module):
     def __init__(self, enc_channels: Sequence[int], dec_channels: Sequence[int] = (64, 128, 256, 512),
-                 stem_channels: Sequence[int] = (32, 48), deep_supervision: bool = True):
+                 stem_channels: Sequence[int] = (32, 48), deep_supervision: bool = True,
+                 hf_prior: bool = False):
         super().__init__()
         assert len(enc_channels) == 4 and len(dec_channels) == 4
+        # Optional fixed high-frequency maps concatenated into the stride-4/2/1 skips.
+        self.hf = HighFrequencyPrior() if hf_prior else None
+        e1, e2, e4 = HighFrequencyPrior.CHANNELS if hf_prior else (0, 0, 0)
         # Adapters: compress the (large) Hiera channels before fusion.
         self.adapters = nn.ModuleList(conv_bn_relu(c, d, k=1) for c, d in zip(enc_channels, dec_channels))
         # High-resolution CNN stem on the raw image (strides 1 and 2).
@@ -157,9 +220,9 @@ class UNetDecoder(nn.Module):
         d1, d2, d3, d4 = dec_channels
         self.up3 = UpBlock(d4, d3, d3)      # 1/32 -> 1/16
         self.up2 = UpBlock(d3, d2, d2)      # 1/16 -> 1/8
-        self.up1 = UpBlock(d2, d1, d1)      # 1/8  -> 1/4
-        self.up0 = UpBlock(d1, s2, s2)      # 1/4  -> 1/2
-        self.upf = UpBlock(s2, s1, s1)      # 1/2  -> 1/1
+        self.up1 = UpBlock(d2, d1 + e4, d1)      # 1/8  -> 1/4
+        self.up0 = UpBlock(d1, s2 + e2, s2)      # 1/4  -> 1/2
+        self.upf = UpBlock(s2, s1 + e1, s1)      # 1/2  -> 1/1
         self.head = nn.Conv2d(s1, 1, 1)
         self.deep_supervision = deep_supervision
         if deep_supervision:
@@ -173,6 +236,14 @@ class UNetDecoder(nn.Module):
             a3 = a3 + ctx16
         x1 = self.stem1(image)
         x2 = self.stem2(x1)
+        if self.hf is not None:
+            h1, h2, h4 = self.hf(image)
+            # a1 / x2 can be a few px smaller than the DWT maps for odd sizes -> crop/resize
+            a1 = torch.cat([a1, F.interpolate(h4, size=a1.shape[-2:], mode="bilinear",
+                                              align_corners=False)], 1)
+            x2 = torch.cat([x2, F.interpolate(h2, size=x2.shape[-2:], mode="bilinear",
+                                              align_corners=False)], 1)
+            x1 = torch.cat([x1, h1], 1)
         u3 = self.up3(a4, a3)
         u2 = self.up2(u3, a2)
         u1 = self.up1(u2, a1)
@@ -194,11 +265,12 @@ class SAM2UNet(nn.Module):
     def __init__(self, variant: str = "large", checkpoint_path: Optional[str] = None,
                  lora_r: int = 8, lora_alpha: float = 16.0, lora_dropout: float = 0.0,
                  grad_checkpointing: bool = False, deep_supervision: bool = True,
-                 trunk: Optional[nn.Module] = None):
+                 trunk: Optional[nn.Module] = None, hf_prior: bool = False):
         super().__init__()
         self.encoder = SAM2HieraEncoder(variant, checkpoint_path, lora_r, lora_alpha, lora_dropout,
                                         grad_checkpointing=grad_checkpointing, trunk=trunk)
-        self.decoder = UNetDecoder(self.encoder.channels, deep_supervision=deep_supervision)
+        self.decoder = UNetDecoder(self.encoder.channels, deep_supervision=deep_supervision,
+                                   hf_prior=hf_prior)
 
     def forward(self, x: torch.Tensor):
         """x must be ImageNet-normalised with H, W divisible by 32."""

@@ -15,7 +15,8 @@ def build_model(a: Dict[str, Any]):
     ckpt = a.get("sam2_ckpt") or str(ROOT / "checkpoints" / SAM2_VARIANTS[a["variant"]][1])
     common = dict(lora_r=a["lora_r"], lora_alpha=a["lora_alpha"], lora_dropout=a["lora_dropout"],
                   grad_checkpointing=a.get("grad_ckpt", False),
-                  deep_supervision=not a.get("no_deep_supervision", False))
+                  deep_supervision=not a.get("no_deep_supervision", False),
+                  hf_prior=a.get("hf_prior", False))
     if a.get("model", "sam2unet") == "sam2unet":
         return SAM2UNet(a["variant"], ckpt, **common)
     from .memory import SAM2MemUNet
